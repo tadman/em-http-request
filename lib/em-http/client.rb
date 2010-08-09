@@ -1,3 +1,5 @@
+# encoding: ISO-8859-1
+
 # #--
 # Copyright (C)2008 Ilya Grigorik
 #
