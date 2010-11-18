@@ -25,17 +25,16 @@ module EventMachine
 
     # E-Tag
     def etag
-      self["ETag"]
+      self[HttpClient::ETAG]
     end
 
     def last_modified
-      time = self["Last-Modified"]
-      Time.parse(time) if time
+      self[HttpClient::LAST_MODIFIED]
     end
 
     # HTTP response status as an integer
     def status
-      Integer(http_status) rescue nil
+      Integer(http_status) rescue 0
     end
 
     # Length of content as an integer, or nil if chunked/unspecified
@@ -71,10 +70,14 @@ module EventMachine
     # When parsing chunked encodings this is set
     attr_accessor :http_chunk_size
 
+    def initialize
+      super
+      @http_chunk_size = '0'
+    end
+
     # Size of the chunk as an integer
     def chunk_size
-      return @chunk_size unless @chunk_size.nil?
-      @chunk_size = @http_chunk_size ? @http_chunk_size.to_i(base=16) : 0
+      @http_chunk_size.to_i(base=16)
     end
   end
 
@@ -85,9 +88,9 @@ module EventMachine
 
     # Escapes a URI.
     def escape(s)
-      s.to_s.gsub(/([^ a-zA-Z0-9_.-]+)/n) {
-        '%'+$1.unpack('H2'*$1.bytesize).join('%').upcase
-      }.tr(' ', '+')
+      s.to_s.gsub(/([^a-zA-Z0-9_.-]+)/n) {
+        '%'+$1.unpack('H2'*bytesize($1)).join('%').upcase
+      }
     end
 
     # Unescapes a URI escaped string.
@@ -95,6 +98,16 @@ module EventMachine
       s.tr('+', ' ').gsub(/((?:%[0-9a-fA-F]{2})+)/n){
         [$1.delete('%')].pack('H*')
       }
+    end
+
+    if ''.respond_to?(:bytesize)
+      def bytesize(string)
+        string.bytesize
+      end
+    else
+      def bytesize(string)
+        string.size
+      end
     end
 
     # Map all header keys to a downcased string version
@@ -118,7 +131,7 @@ module EventMachine
 
       # Non CONNECT proxies require that you provide the full request
       # uri in request header, as opposed to a relative path.
-      query = uri.join(query) if proxy and not proxy[:use_connect]
+      query = uri.join(query) if proxy && proxy[:type] != :socks && !proxy[:use_connect]
 
       HTTP_REQUEST_HEADER % [method.to_s.upcase, query]
     end
@@ -133,9 +146,7 @@ module EventMachine
       if !uri.query.to_s.empty?
         encoded_query = [encoded_query, uri.query].reject {|part| part.empty?}.join("&")
       end
-
-      return uri.path if encoded_query.to_s.empty?
-      "#{uri.path}?#{encoded_query}"
+      encoded_query.to_s.empty? ? uri.path : "#{uri.path}?#{encoded_query}"
     end
 
     # URL encodes query parameters:
@@ -146,6 +157,29 @@ module EventMachine
       else
         escape(k) + "=" + escape(v)
       end
+    end
+
+    def form_encode_body(obj)
+      pairs = []
+      recursive = Proc.new do |h, prefix|
+        h.each do |k,v|
+          key = prefix == '' ? escape(k) : "#{prefix}[#{escape(k)}]"
+
+          if v.is_a? Array
+            nh = Hash.new
+            v.size.times { |t| nh[t] = v[t] }
+            recursive.call(nh, key)
+
+          elsif v.is_a? Hash
+            recursive.call(v, key)
+          else
+            pairs << "#{key}=#{escape(v)}"
+          end
+        end
+      end
+
+      recursive.call(obj, '')
+      return pairs.join('&')
     end
 
     # Encode a field in an HTTP header
@@ -193,10 +227,14 @@ module EventMachine
     TRANSFER_ENCODING="TRANSFER_ENCODING"
     CONTENT_ENCODING="CONTENT_ENCODING"
     CONTENT_LENGTH="CONTENT_LENGTH"
+    CONTENT_TYPE="CONTENT_TYPE".freeze
+    LAST_MODIFIED="LAST_MODIFIED"
     KEEP_ALIVE="CONNECTION"
     SET_COOKIE="SET_COOKIE"
     LOCATION="LOCATION"
     HOST="HOST"
+    ETAG="ETAG"
+
     CRLF="\r\n"
 
     attr_accessor :method, :options, :uri
@@ -211,24 +249,35 @@ module EventMachine
       @redirects = 0
       @response = ''
       @error = ''
+      @headers = nil
       @last_effective_url = nil
       @content_decoder = nil
+      @content_charset = nil
       @stream = nil
       @disconnect = nil
       @state = :response_header
+      @socks_state = nil
     end
 
     # start HTTP request once we establish connection to host
     def connection_completed
-      # if we need to negotiate the proxy connection first, then
-      # issue a CONNECT query and wait for 200 response
-      if connect_proxy? and @state == :response_header
-        @state = :connect_proxy
+      # if a socks proxy is specified, then a connection request
+      # has to be made to the socks server and we need to wait
+      # for a response code
+      if socks_proxy? and @state == :response_header
+        @state = :connect_socks_proxy
+        send_socks_handshake
+
+        # if we need to negotiate the proxy connection first, then
+        # issue a CONNECT query and wait for 200 response
+      elsif connect_proxy? and @state == :response_header
+        @state = :connect_http_proxy
         send_request_header
 
         # if connecting via proxy, then state will be :proxy_connected,
         # indicating successful tunnel. from here, initiate normal http
         # exchange
+
       else
         @state = :response_header
         ssl = @options[:tls] || @options[:ssl] || {}
@@ -257,6 +306,7 @@ module EventMachine
       # fail the connection directly
       dns_error == true ? fail(self) : unbind
     end
+    alias :close :on_error
 
     # assign a stream processing block
     def stream(&blk)
@@ -266,6 +316,11 @@ module EventMachine
     # assign disconnect callback for websocket
     def disconnect(&blk)
       @disconnect = blk
+    end
+
+    # assign a headers parse callback
+    def headers(&blk)
+      @headers = blk
     end
 
     # raw data push from the client (WebSocket) should
@@ -285,16 +340,51 @@ module EventMachine
     def normalize_body
       @normalized_body ||= begin
         if @options[:body].is_a? Hash
-          @options[:body].to_params
+          form_encode_body(@options[:body])
         else
           @options[:body]
         end
       end
     end
 
+    # determines if there is enough data in the buffer
+    def has_bytes?(num)
+      @data.size >= num
+    end
+
     def websocket?; @uri.scheme == 'ws'; end
     def proxy?; !@options[:proxy].nil?; end
-    def connect_proxy?; proxy? && (@options[:proxy][:use_connect] == true); end
+
+    # determines if a proxy should be used that uses
+    # http-headers as proxy-mechanism
+    #
+    # this is the default proxy type if none is specified
+    def http_proxy?; proxy? && [nil, :http].include?(@options[:proxy][:type]); end
+
+    # determines if a http-proxy should be used with
+    # the CONNECT verb
+    def connect_proxy?; http_proxy? && (@options[:proxy][:use_connect] == true); end
+
+    # determines if a SOCKS5 proxy should be used
+    def socks_proxy?; proxy? && (@options[:proxy][:type] == :socks); end
+
+    def socks_methods
+      methods = []
+      methods << 2 if !options[:proxy][:authorization].nil? # 2 => Username/Password Authentication
+      methods << 0 # 0 => No Authentication Required
+
+      methods
+    end
+
+    def send_socks_handshake
+      # Method Negotiation as described on
+      # http://www.faqs.org/rfcs/rfc1928.html Section 3
+
+      @socks_state = :method_negotiation
+
+      methods = socks_methods
+      send_data [5, methods.size].pack('CC') + methods.pack('C*')
+    end
 
     def send_request_header
       query   = @options[:query]
@@ -305,7 +395,7 @@ module EventMachine
 
       request_header = nil
 
-      if proxy
+      if http_proxy?
         # initialize headers for the http proxy
         head = proxy[:head] ? munge_header_keys(proxy[:head]) : {}
         head['proxy-authorization'] = proxy[:authorization] if proxy[:authorization]
@@ -313,7 +403,7 @@ module EventMachine
         # if we need to negotiate the tunnel connection first, then
         # issue a CONNECT query to the proxy first. This is an optional
         # flag, by default we will provide full URIs to the proxy
-        if @state == :connect_proxy
+        if @state == :connect_http_proxy
           request_header = HTTP_REQUEST_HEADER % ['CONNECT', "#{@uri.host}:#{@uri.port}"]
         end
       end
@@ -386,6 +476,7 @@ module EventMachine
     end
 
     def on_decoded_body_data(data)
+      data.force_encoding @content_charset  if @content_charset
       if @stream
         @stream.call(data)
       else
@@ -395,20 +486,24 @@ module EventMachine
 
     def unbind
       if (@state == :finished) && (@last_effective_url != @uri) && (@redirects < @options[:redirects])
-        # update uri to redirect location if we're allowed to traverse deeper
-        @uri = @last_effective_url
+        begin
+          # update uri to redirect location if we're allowed to traverse deeper
+          @uri = @last_effective_url
 
-        # keep track of the depth of requests we made in this session
-        @redirects += 1
+          # keep track of the depth of requests we made in this session
+          @redirects += 1
 
-        # swap current connection and reassign current handler
-        req = HttpOptions.new(@method, @uri, @options)
-        reconnect(req.host, req.port)
+          # swap current connection and reassign current handler
+          req = HttpOptions.new(@method, @uri, @options)
+          reconnect(req.host, req.port)
 
-        @response_header = HttpResponseHeader.new
-        @state = :response_header
-        @response = ''
-        @data.clear
+          @response_header = HttpResponseHeader.new
+          @state = :response_header
+          @response = ''
+          @data.clear
+        rescue EventMachine::ConnectionError => e
+          on_error(e.message, true)
+        end
       else
         if @state == :finished || (@state == :body && @bytes_remaining.nil?)
           succeed(self)
@@ -425,7 +520,9 @@ module EventMachine
 
     def dispatch
       while case @state
-          when :connect_proxy
+          when :connect_socks_proxy
+            parse_socks_response
+          when :connect_http_proxy
             parse_response_header
           when :response_header
             parse_response_header
@@ -471,13 +568,17 @@ module EventMachine
     def parse_response_header
       return false unless parse_header(@response_header)
 
+      # invoke headers callback after full parse if one
+      # is specified by the user
+      @headers.call(@response_header) if @headers
+
       unless @response_header.http_status and @response_header.http_reason
         @state = :invalid
         on_error "no HTTP response"
         return false
       end
 
-      if @state == :connect_proxy
+      if @state == :connect_http_proxy
         # when a successfull tunnel is established, the proxy responds with a
         # 200 response code. from here, the tunnel is transparent.
         if @response_header.http_status.to_i == 200
@@ -513,10 +614,13 @@ module EventMachine
         end
       end
 
-      # shortcircuit on HEAD requests
+      # Fire callbacks immediately after recieving header requests
+      # if the request method is HEAD. In case of a redirect, terminate
+      # current connection and reinitialize the process.
       if @method == "HEAD"
         @state = :finished
-        unbind
+        close_connection
+        return false
       end
 
       if websocket?
@@ -542,6 +646,118 @@ module EventMachine
           @content_decoder = decoder_class.new do |s| on_decoded_body_data(s) end
         rescue HttpDecoders::DecoderError
           on_error "Content-decoder error"
+        end
+      end
+
+      if ''.respond_to?(:force_encoding) && /;\s*charset=\s*(.+?)\s*(;|$)/.match(response_header[CONTENT_TYPE])
+        @content_charset = Encoding.find $1
+      end
+
+      true
+    end
+
+    def send_socks_connect_request
+      # TO-DO: Implement address types for IPv6 and Domain
+      begin
+        ip_address = Socket.gethostbyname(@uri.host).last
+        send_data [5, 1, 0, 1, ip_address, @uri.port].flatten.pack('CCCCA4n')
+
+      rescue
+        @state = :invalid
+        on_error "could not resolve host", true
+        return false
+      end
+
+      true
+    end
+
+    # parses socks 5 server responses as specified
+    # on http://www.faqs.org/rfcs/rfc1928.html
+    def parse_socks_response
+      if @socks_state == :method_negotiation
+        return false unless has_bytes? 2
+
+        _, method = @data.read(2).unpack('CC')
+
+        if socks_methods.include?(method)
+          if method == 0
+            @socks_state = :connecting
+
+            return send_socks_connect_request
+
+          elsif method == 2
+            @socks_state = :authenticating
+
+            credentials = @options[:proxy][:authorization]
+            if credentials.size < 2
+              @state = :invalid
+              on_error "username and password are not supplied"
+              return false
+            end
+
+            username, password = credentials
+
+            send_data [5, username.length, username, password.length, password].pack('CCA*CA*')
+          end
+
+        else
+          @state = :invalid
+          on_error "proxy did not accept method"
+          return false
+        end
+
+      elsif @socks_state == :authenticating
+        return false unless has_bytes? 2
+
+        _, status_code = @data.read(2).unpack('CC')
+
+        if status_code == 0
+          # success
+          @socks_state = :connecting
+
+          return send_socks_connect_request
+
+        else
+          # error
+          @state = :invalid
+          on_error "access denied by proxy"
+          return false
+        end
+
+      elsif @socks_state == :connecting
+        return false unless has_bytes? 10
+
+        _, response_code, _, address_type, _, _ = @data.read(10).unpack('CCCCNn')
+
+        if response_code == 0
+          # success
+          @socks_state = :connected
+          @state = :proxy_connected
+
+          @response_header = HttpResponseHeader.new
+
+          # connection_completed will invoke actions to
+          # start sending all http data transparently
+          # over the socks connection
+          connection_completed
+
+        else
+          # error
+          @state = :invalid
+
+          error_messages = {
+            1 => "general socks server failure",
+            2 => "connection not allowed by ruleset",
+            3 => "network unreachable",
+            4 => "host unreachable",
+            5 => "connection refused",
+            6 => "TTL expired",
+            7 => "command not supported",
+            8 => "address type not supported"
+          }
+          error_message = error_messages[response_code] || "unknown error (code: #{response_code})"
+          on_error "socks5 connect error: #{error_message}"
+          return false
         end
       end
 
@@ -652,8 +868,8 @@ module EventMachine
       # slice the message out of the buffer and pass in
       # for processing, and buffer data otherwise
       buffer = @data.read
-      while msg = buffer.slice!(/\000([^\377]*)\377/)
-        msg.gsub!(/\A\x00|\xff\z/, '')
+      while msg = buffer.slice!(/\000([^\377]*)\377/n)
+        msg.gsub!(/\A\x00|\xff\z/n, '')
         @stream.call(msg)
       end
 

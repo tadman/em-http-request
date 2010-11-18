@@ -12,13 +12,20 @@ module EventMachine
     end
 
     class FakeHttpClient < EventMachine::HttpClient
+      attr_writer :response
+      attr_reader :data
       def setup(response, uri)
         @uri = uri
         if response == :fail
           fail(self)
         else
-          receive_data(response)
-          succeed(self)
+          if response.respond_to?(:call)
+            response.call(self)
+            @state = :body
+          else
+            receive_data(response)
+          end
+          @state == :body ? succeed(self) : fail(self)
         end
       end
 
@@ -64,7 +71,8 @@ module EventMachine
       @@pass_through_requests
     end
 
-    def self.parse_register_args(args)
+    def self.parse_register_args(args, &proc)
+      args << proc{|client| proc.call(client); ''} if proc
       headers, data = case args.size
       when 3
         args[2].is_a?(Hash) ?
@@ -72,6 +80,8 @@ module EventMachine
           [{}, args[2]]
       when 4
         [args[2], args[3]]
+      else
+        raise
       end
 
       url = args[0]
@@ -79,8 +89,8 @@ module EventMachine
       [headers, url, method, data]
     end
 
-    def self.register(*args)
-      headers, url, method, data = parse_register_args(args)
+    def self.register(*args, &proc)
+      headers, url, method, data = parse_register_args(args, &proc)
       @@registry[RegisteredRequest.build(url, method, headers)] = data
     end
 
@@ -114,7 +124,8 @@ module EventMachine
       if self.class.registered?(query, @req.method, headers)
         self.class.increment_access(query, @req.method, headers)
         client = FakeHttpClient.new(nil)
-        client.setup(self.class.registered_content(query, @req.method, headers), @req.uri)
+        content = self.class.registered_content(query, @req.method, headers)
+        client.setup(content, @req.uri)
         client
       elsif @@pass_through_requests
         real_send_request

@@ -68,17 +68,62 @@ describe EventMachine::HttpRequest do
     }
   end
 
-  it "should accept optional host override" do
-    EventMachine.run {
-      http = EventMachine::HttpRequest.new('http://google.com:8080/').get :host => '127.0.0.1'
+  context "host override" do
 
-      http.errback { failed }
-      http.callback {
-        http.response_header.status.should == 200
-        http.response.should match(/Hello/)
-        EventMachine.stop
+    it "should accept optional host" do
+      EventMachine.run {
+        http = EventMachine::HttpRequest.new('http://google.com:8080/').get :host => '127.0.0.1'
+
+        http.errback { failed }
+        http.callback {
+          http.response_header.status.should == 200
+          http.response.should match(/Hello/)
+          EventMachine.stop
+        }
       }
-    }
+    end
+
+    it "should reset host on redirect" do
+      EventMachine.run {
+        http = EventMachine::HttpRequest.new('http://127.0.0.1:8080/redirect').get :redirects => 1, :host => '127.0.0.1'
+
+        http.errback { failed }
+        http.callback {
+          http.response_header.status.should == 200
+          http.response_header["CONTENT_ENCODING"].should == "gzip"
+          http.response.should == "compressed"
+          http.last_effective_url.to_s.should == 'http://127.0.0.1:8080/gzip'
+          http.redirects.should == 1
+
+          EM.stop
+        }
+      }
+    end
+
+    it "should follow redirects on HEAD method" do
+      EventMachine.run {
+        http = EventMachine::HttpRequest.new('http://127.0.0.1:8080/redirect/head').head :redirects => 1
+        http.errback { failed }
+        http.callback {
+          http.response_header.status.should == 200
+          http.last_effective_url.to_s.should == 'http://127.0.0.1:8080/'
+          EM.stop
+        }
+      }
+    end
+
+    it "should follow redirects on HEAD method (external)" do
+
+      EventMachine.run {
+        http = EventMachine::HttpRequest.new('http://www.google.com/').head :redirects => 1
+        http.errback { failed }
+        http.callback {
+          http.response_header.status.should == 200
+          EM.stop
+        }
+      }
+    end
+
   end
 
   it "should perform successfull GET with a URI passed as argument" do
@@ -202,6 +247,19 @@ describe EventMachine::HttpRequest do
     }
   end
 
+  it "should escape body on POST" do
+    EventMachine.run {
+      http = EventMachine::HttpRequest.new('http://127.0.0.1:8080/').post :body => {:stuff => 'string&string'}
+
+      http.errback { failed }
+      http.callback {
+        http.response_header.status.should == 200
+        http.response.should == "stuff=string%26string"
+        EventMachine.stop
+      }
+    }
+  end
+
   it "should perform successfull POST with Ruby Hash/Array as params" do
     EventMachine.run {
       http = EventMachine::HttpRequest.new('http://127.0.0.1:8080/').post :body => {"key1" => 1, "key2" => [2,3]}
@@ -246,7 +304,7 @@ describe EventMachine::HttpRequest do
     EventMachine.run {
 
       # digg.com uses chunked encoding
-      http = EventMachine::HttpRequest.new('http://digg.com/').get
+      http = EventMachine::HttpRequest.new('http://digg.com/news').get
 
       http.errback { failed }
       http.callback {
@@ -291,6 +349,20 @@ describe EventMachine::HttpRequest do
       http.errback { failed }
       http.callback {
         http.response_header.status.should == 200
+        EventMachine.stop
+      }
+    }
+  end
+
+  it "should return ETag and Last-Modified headers" do
+    EventMachine.run {
+      http = EventMachine::HttpRequest.new('http://127.0.0.1:8080/echo_query').get
+
+      http.errback { failed }
+      http.callback {
+        http.response_header.status.should == 200
+        http.response_header.etag.should match('abcdefg')
+        http.response_header.last_modified.should match('Fri, 13 Aug 2010 17:31:21 GMT')
         EventMachine.stop
       }
     }
@@ -421,12 +493,11 @@ describe EventMachine::HttpRequest do
     end
 
     it "should fail gracefully on an invalid host in Location header" do
-      pending "validate tld's?"
       EventMachine.run {
         http = EventMachine::HttpRequest.new('http://127.0.0.1:8080/redirect/badhost').get :redirects => 1
         http.callback { failed }
         http.errback {
-          http.error.should == 'Location header format error'
+          http.error.should == 'unable to resolve server address'
           EM.stop
         }
       }
@@ -448,6 +519,49 @@ describe EventMachine::HttpRequest do
         EventMachine.stop
       }
     }
+  end
+
+  context "optional header callback" do
+    it "should optionally pass the response headers" do
+      EventMachine.run {
+        http = EventMachine::HttpRequest.new('http://127.0.0.1:8080/').get
+
+        http.errback { failed }
+        http.headers { |hash|
+          hash.should be_an_kind_of Hash
+          hash.should include 'CONNECTION'
+          hash.should include 'CONTENT_LENGTH'
+        }
+
+        http.callback {
+          http.response_header.status.should == 200
+          http.response.should match(/Hello/)
+          EventMachine.stop
+        }
+      }
+    end
+
+    it "should allow to terminate current connection from header callback" do
+      EventMachine.run {
+        http = EventMachine::HttpRequest.new('http://127.0.0.1:8080/').get
+
+        http.callback { failed }
+        http.headers { |hash|
+          hash.should be_an_kind_of Hash
+          hash.should include 'CONNECTION'
+          hash.should include 'CONTENT_LENGTH'
+
+          http.close('header callback terminated connection')
+        }
+
+        http.errback { |e|
+          http.response_header.status.should == 200
+          http.error.should == 'header callback terminated connection'
+          http.response.should == ''
+          EventMachine.stop
+        }
+      }
+    end
   end
 
   it "should optionally pass the deflate-encoded response body progressively" do
@@ -643,8 +757,8 @@ describe EventMachine::HttpRequest do
       http = EventMachine::MockHttpRequest.new('http://www.google.ca/').get
       http.errback { fail }
       http.callback {
-        c1 = "PREF=ID=9454187d21c4a6a6:TM=1258403955:LM=1258403955:S=2-mf1n5oV5yAeT9-; expires=Wed, 16-Nov-2011 20:39:15 GMT; path=/; domain=.google.ca"
-        c2 = "NID=28=lvxxVdiBQkCetu_WFaUxLyB7qPlHXS5OdAGYTqge_laVlCKVN8VYYeVBh4bNZiK_Oan2gm8oP9GA-FrZfMPC3ZMHeNq37MG2JH8AIW9LYucU8brOeuggMEbLNNXuiWg4; expires=Tue, 18-May-2010 20:39:15 GMT; path=/; domain=.google.ca; HttpOnly"
+        c1 = "PREF=ID=11955ae9690fd292:TM=1281823106:LM=1281823106:S=wHdloFqGQ_OLSE92; expires=Mon, 13-Aug-2012 21:58:26 GMT; path=/; domain=.google.ca"
+        c2 = "NID=37=USTdOsxOSMbLjphkJ3S5Ueua3Yc23COXuK_pbztcHx7JoyhomwQySrvebCf3_u8eyrBiLWssVzaZcEOiKGEJbNdy8lRhnq_mfrdz693LaMjNPh__ccW4sgn1ZO6nQltE; expires=Sun, 13-Feb-2011 21:58:26 GMT; path=/; domain=.google.ca; HttpOnly"
         http.response_header.cookie.should == [c1, c2]
 
         EventMachine.stop
